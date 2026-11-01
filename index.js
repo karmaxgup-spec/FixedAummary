@@ -961,6 +961,14 @@ async function maybeSummarizeTurns() {
     const allAssistantTurns = getAssistantTurns(chat);
     const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
+    // Safety net: any visible turn already covered by summarizedUpTo should be hidden.
+    const stale = visibleTurns.filter(t => t.index <= store.summarizedUpTo);
+    if (stale.length > 0) {
+        log(`Found ${stale.length} visible turn(s) at or before summarizedUpTo; ghosting them.`);
+        for (const t of stale) await ghostMessage(t.index);
+        await saveChatStore();
+    }
+
     log(`Visible assistant turns: ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
 
     if (visibleTurns.length <= s.verbatimTurns) return;
@@ -980,6 +988,8 @@ async function maybeSummarizeTurns() {
             const cutoff = visibleTurns[visibleTurns.length - s.verbatimTurns - 1];
             if (cutoff) {
                 store.summarizedUpTo = cutoff.index;
+                // Hide the skipped backlog too (without summarizing it), otherwise it stays in the prompt forever.
+                await ghostMessagesUpTo(cutoff.index, 0);
                 log(`Skipped backlog. summarizedUpTo set to ${store.summarizedUpTo}`);
             }
             catchupDismissed = true;
@@ -2693,168 +2703,4 @@ async function refreshOllamaModels() {
     const ollamaUrl = s.ollamaUrl || 'http://localhost:11434';
     const modelSelect = document.getElementById('summaryception_ollama_model');
 
-    showConnectionStatus('loading', 'Fetching Ollama models...');
-
-    try {
-        const models = await fetchOllamaModels(ollamaUrl);
-        s.ollamaModelsCache = models.map(m => ({ name: m.name }));
-        saveSettings();
-
-        if (modelSelect) {
-            populateOllamaModelDropdown(modelSelect, models, s.ollamaModel);
-        }
-
-        showConnectionStatus('success', `Found ${models.length} model(s)`);
-        toastr.success(`Found ${models.length} Ollama model(s)`, 'Summaryception');
-    } catch (error) {
-        console.error('[Summaryception] Failed to fetch Ollama models:', error);
-        showConnectionStatus('error', `Failed: ${error.message}`);
-        toastr.error(`Failed to fetch Ollama models: ${error.message}`, 'Summaryception');
-    }
-}
-
-async function testOpenAIConnectionHandler() {
-    const s = getSettings();
-
-    if (!s.openaiUrl) {
-        toastr.warning('Please enter an endpoint URL first.', 'Summaryception');
-        return;
-    }
-    if (!s.openaiModel) {
-        toastr.warning('Please enter a model name first.', 'Summaryception');
-        return;
-    }
-
-    showConnectionStatus('loading', 'Testing connection...');
-
-    const result = await testOpenAIConnection(s.openaiUrl, s.openaiKey, s.openaiModel);
-
-    if (result.success) {
-        showConnectionStatus('success', result.message);
-        toastr.success(result.message, 'Summaryception');
-    } else {
-        showConnectionStatus('error', result.message);
-        toastr.error(result.message, 'Summaryception');
-    }
-}
-
-function showConnectionStatus(type, message) {
-    const container = document.getElementById('summaryception_connection_status');
-    const icon = document.getElementById('summaryception_connection_status_icon');
-    const text = document.getElementById('summaryception_connection_status_text');
-
-    if (!container || !icon || !text) return;
-
-    container.style.display = 'flex';
-    container.className = 'summaryception-connection-status ' + type;
-
-    const icons = {
-        success: 'fa-solid fa-circle-check',
-        error: 'fa-solid fa-circle-xmark',
-        loading: 'fa-solid fa-spinner fa-spin',
-    };
-
-    icon.className = icons[type] || 'fa-solid fa-circle';
-    text.textContent = message;
-
-    if (type !== 'loading') {
-        setTimeout(() => {
-            if (container) container.style.display = 'none';
-        }, TUNING.connectionStatusTimeout);
-    }
-}
-
-async function fetchProfilesFallback(selectElement, currentValue) {
-    try {
-        const response = await fetch('/api/connection-manager/profiles', {
-            method: 'GET',
-            headers: SillyTavern.getContext().getRequestHeaders?.() || {
-                'Content-Type': 'application/json',
-            },
-        });
-
-        if (!response.ok) {
-            console.warn('[Summaryception] Could not fetch connection profiles from API');
-            return;
-        }
-
-        const profiles = await response.json();
-
-        selectElement.innerHTML = '<option value="">-- Select a Profile --</option>';
-
-        if (Array.isArray(profiles)) {
-            for (const profile of profiles) {
-                const opt = document.createElement('option');
-                opt.value = profile.id || profile.name;
-                opt.textContent = profile.name || profile.id;
-                selectElement.appendChild(opt);
-            }
-        } else if (typeof profiles === 'object') {
-            for (const [id, profile] of Object.entries(profiles)) {
-                const opt = document.createElement('option');
-                opt.value = id;
-                opt.textContent = profile.name || id;
-                selectElement.appendChild(opt);
-            }
-        }
-
-        if (currentValue) {
-            selectElement.value = currentValue;
-        }
-    } catch (error) {
-        console.warn('[Summaryception] Could not fetch connection profiles:', error);
-    }
-}
-
-// ─── Initialization ──────────────────────────────────────────────────
-
-/**
- * Work out this extension's folder as SillyTavern expects it (e.g. "third-party/My-Folder"),
- * from the URL this module was loaded from. Lets the extension run from any folder name.
- */
-function getExtensionTemplateName() {
-    const fallback = 'third-party/Summaryception';
-    try {
-        const path = new URL('.', import.meta.url).pathname.replace(/\/+$/, '');
-        const marker = '/extensions/';
-        const idx = path.indexOf(marker);
-        if (idx === -1) return fallback;
-        return decodeURIComponent(path.slice(idx + marker.length));
-    } catch (e) {
-        return fallback;
-    }
-}
-
-const EXTENSION_TEMPLATE_NAME = getExtensionTemplateName();
-
-(async function init() {
-    const {
-        eventSource,
-        event_types,
-        renderExtensionTemplateAsync,
-    } = SillyTavern.getContext();
-
-    getSettings();
-
-    const html = await renderExtensionTemplateAsync(
-        EXTENSION_TEMPLATE_NAME,
-        'settings',
-        {}
-    );
-    $('#extensions_settings2').append(html);
-
-    bindUIEvents();
-    initConnectionUI();
-
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-
-    registerSlashCommands();
-
-    eventSource.on(event_types.APP_READY, () => {
-        updateInjection();
-        updateUI();
-        console.log(LOG_PREFIX, 'v5.5.4 loaded. Connection Settings available');
-    });
-})();
+    showConnectionStatus('loading', 'Fetching O
