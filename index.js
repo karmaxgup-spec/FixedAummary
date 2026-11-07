@@ -1627,17 +1627,16 @@ function updateInjection() {
         const s = getSettings();
 
         if (!s.enabled) {
-            if (_lastInjected !== '') {
-                setExtensionPrompt(MODULE_NAME, '',
-                    TUNING.injectionPosition, TUNING.injectionDepth,
-                    TUNING.injectionScan, TUNING.injectionRole);
-                _lastInjected = '';
-            }
+            setExtensionPrompt(MODULE_NAME, '',
+                TUNING.injectionPosition, TUNING.injectionDepth,
+                TUNING.injectionScan, TUNING.injectionRole);
+            _lastInjected = '';
             return;
         }
 
+        // Always re-set the prompt. SillyTavern clears all extension prompts when a chat
+        // is opened (clearChat), so skipping "unchanged" text would leave the model with no summary.
         const summaryBlock = assembleSummaryBlock();
-        if (summaryBlock === _lastInjected) return;
 
         setExtensionPrompt(MODULE_NAME, summaryBlock || '',
             TUNING.injectionPosition, TUNING.injectionDepth,
@@ -1682,6 +1681,7 @@ function onChatChanged() {
 
 function onGenerationStarted() {
     updateInjection();
+    updateUI();
 }
 
 // ─── Slash Commands ──────────────────────────────────────────────────
