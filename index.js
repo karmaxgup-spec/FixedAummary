@@ -350,7 +350,58 @@ function chatSwitched(key) {
 async function saveChatStore() {
     const store = getChatStore();
     store.chatId = currentChatKey();   // lets repairIfBranched tell a real branch from a normal reload
+    writeBackup(store);
     await SillyTavern.getContext().saveMetadata();
+}
+
+// ─── Per-chat backup (lives in extension settings, not chat metadata) ─────
+// Safety net: if a chat opens with its summaries missing while a backup exists for
+// that chat id, the summaries are restored from the backup.
+const MAX_BACKUPS = 50;
+
+function hasContent(layers) {
+    return Array.isArray(layers) && layers.some(l => Array.isArray(l) && l.length > 0);
+}
+
+function writeBackup(store) {
+    const key = currentChatKey();
+    if (!key) return;
+    const s = getSettings();
+    s.backups = s.backups || {};
+    s.backups[key] = {
+        layers: structuredClone(store.layers || []),
+        summarizedUpTo: store.summarizedUpTo ?? -1,
+        ghostedIndices: [...(store.ghostedIndices || [])],
+        savedAt: Date.now(),
+    };
+    const keys = Object.keys(s.backups);
+    if (keys.length > MAX_BACKUPS) {
+        keys.sort((a, b) => s.backups[a].savedAt - s.backups[b].savedAt)
+            .slice(0, keys.length - MAX_BACKUPS)
+            .forEach(k => delete s.backups[k]);
+    }
+    saveSettings();
+}
+
+function restoreBackupIfEmpty() {
+    const key = currentChatKey();
+    if (!key) return false;
+    const store = getChatStore();
+    if (hasContent(store.layers)) return false;
+    const b = getSettings().backups?.[key];
+    if (!b || !hasContent(b.layers)) return false;
+
+    store.layers = structuredClone(b.layers);
+    store.summarizedUpTo = b.summarizedUpTo ?? -1;
+    store.ghostedIndices = [...(b.ghostedIndices || [])];
+    log('Restored summaries from backup for this chat.');
+    return true;
+}
+
+function forgetBackup() {
+    const key = currentChatKey();
+    const s = getSettings();
+    if (s.backups && key) delete s.backups[key];
 }
 
 function getPlayerName() {
@@ -1673,6 +1724,7 @@ function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
     setTimeout(async () => {
+        restoreBackupIfEmpty();
         await repairIfBranched();
         updateInjection();
         updateUI();
@@ -1722,6 +1774,7 @@ function registerSlashCommands() {
                 await unghostAllMessages();
 
                 const store = getChatStore();
+                forgetBackup();
                 store.layers.length = 0;
                 store.summarizedUpTo = -1;
                 store.ghostedIndices = [];
@@ -2252,6 +2305,7 @@ function bindUIEvents() {
         }
 
         const store = getChatStore();
+        forgetBackup();
         store.layers.length = 0;
         store.summarizedUpTo = -1;
         store.ghostedIndices = [];
