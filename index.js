@@ -338,7 +338,18 @@ function getChatStore() {
     return store;
 }
 
+function currentChatKey() {
+    try { return SillyTavern.getContext().getCurrentChatId() ?? null; } catch { return null; }
+}
+
+/** True when the user has switched chats since `key` was captured. */
+function chatSwitched(key) {
+    return currentChatKey() !== key;
+}
+
 async function saveChatStore() {
+    const store = getChatStore();
+    store.chatId = currentChatKey();   // lets repairIfBranched tell a real branch from a normal reload
     await SillyTavern.getContext().saveMetadata();
 }
 
@@ -544,8 +555,12 @@ async function repairIfBranched() {
 
     const chatLength = chat.length;
 
+    // A branch copies metadata into a NEW chat id, so a store whose chatId matches the
+    // current chat was not branched (it may just be loaded late or the chat is shorter).
+    const sameChat = !!store.chatId && store.chatId === currentChatKey();
+
     // If summarizedUpTo is beyond (or at) the end of the chat, we branched
-    if (store.summarizedUpTo >= chatLength) {
+    if (store.summarizedUpTo >= chatLength && !sameChat) {
         const oldSummarizedUpTo = store.summarizedUpTo;
         log(`Branch detected! summarizedUpTo (${oldSummarizedUpTo}) >= chat length (${chatLength}). Repairing...`);
 
@@ -961,14 +976,6 @@ async function maybeSummarizeTurns() {
     const allAssistantTurns = getAssistantTurns(chat);
     const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
-    // Safety net: any visible turn already covered by summarizedUpTo should be hidden.
-    const stale = visibleTurns.filter(t => t.index <= store.summarizedUpTo);
-    if (stale.length > 0) {
-        log(`Found ${stale.length} visible turn(s) at or before summarizedUpTo; ghosting them.`);
-        for (const t of stale) await ghostMessage(t.index);
-        await saveChatStore();
-    }
-
     log(`Visible assistant turns: ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
 
     if (visibleTurns.length <= s.verbatimTurns) return;
@@ -988,8 +995,6 @@ async function maybeSummarizeTurns() {
             const cutoff = visibleTurns[visibleTurns.length - s.verbatimTurns - 1];
             if (cutoff) {
                 store.summarizedUpTo = cutoff.index;
-                // Hide the skipped backlog too (without summarizing it), otherwise it stays in the prompt forever.
-                await ghostMessagesUpTo(cutoff.index, 0);
                 log(`Skipped backlog. summarizedUpTo set to ${store.summarizedUpTo}`);
             }
             catchupDismissed = true;
@@ -1053,6 +1058,7 @@ async function summarizeOneBatch(visibleTurns) {
     }
 
     isSummarizing = true;
+    const chatKey = currentChatKey();
 
     try {
         const startIdx = batch[0].index;
@@ -1091,6 +1097,10 @@ async function summarizeOneBatch(visibleTurns) {
 
         const summary = await callSummarizer(storyTxt, contextStr);
         trace('  summary length:', summary?.length ?? 'UNDEFINED');
+        if (chatSwitched(chatKey)) {
+            log('Chat changed during summarization; discarding result for the old chat.');
+            return false;
+        }
 
         if (!summary) {
             log('Summarization failed for batch, leaving turns intact for next attempt.');
@@ -1164,6 +1174,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         return false;
     }
 
+    const chatKey = currentChatKey();
     const startIdx = batch[0].index;
     const endIdx = batch[batch.length - 1].index;
 
@@ -1209,6 +1220,10 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         trace('  About to call callSummarizer...');
         const summary = await callSummarizer(storyTxt, contextStr);
         trace('  callSummarizer returned, length:', summary?.length ?? 'UNDEFINED');
+        if (chatSwitched(chatKey)) {
+            log('Chat changed during catch-up batch; discarding result.');
+            return false;
+        }
 
         if (!summary) {
             log('Summarization failed for batch, leaving turns intact for next attempt.');
@@ -1284,11 +1299,16 @@ async function runCatchup(visibleTurns, overflow) {
     );
 
     isSummarizing = true;
+    const catchupKey = currentChatKey();
 
     try {
         let consecutiveFailures = 0;
 
         while (!cancelled) {
+            if (chatSwitched(catchupKey)) {
+                log('Chat changed; stopping catch-up.');
+                break;
+            }
             trace(`  Loop iteration - completed: ${completed}, failed: ${failed}`);
 
             const { chat } = SillyTavern.getContext();
@@ -1432,10 +1452,10 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
  * Catches content that arrived by import or before the setting was enabled.
  * Returns the number of snippets removed (0 when the feature is off).
  */
-function pruneAutoDeleteDepth() {
+function pruneAutoDeleteDepth(depthOverride) {
     const s = getSettings();
     const store = getChatStore();
-    const depth = Number(s.autoDeleteDepth) || 0;
+    const depth = Number(depthOverride ?? s.autoDeleteDepth) || 0;
     if (depth <= 0 || !store.layers) return 0;
 
     const layer = store.layers[depth];
@@ -1449,8 +1469,6 @@ function pruneAutoDeleteDepth() {
 async function maybePromoteLayer(layerIndex) {
     const s = getSettings();
     const store = getChatStore();
-
-    pruneAutoDeleteDepth();
 
     if (layerIndex >= s.maxLayers - 1) {
         log(`Max layer depth (${s.maxLayers}) reached.`);
@@ -1508,6 +1526,7 @@ async function maybePromoteLayer(layerIndex) {
     const toMerge = layer.splice(0, s.snippetsPerPromotion);
     const storyTxt = toMerge.map(sn => sn.text).join(' ');
     const contextStr = buildFullContext(layerIndex + 1);
+    const chatKey = currentChatKey();
 
     toastr.info(
         `Promoting ${toMerge.length} snippets: Layer ${layerIndex} → Layer ${layerIndex + 1}`,
@@ -1516,7 +1535,7 @@ async function maybePromoteLayer(layerIndex) {
     );
 
     const metaSummary = await callSummarizer(storyTxt, contextStr);
-    if (!metaSummary) {
+    if (!metaSummary || chatSwitched(chatKey)) {
         layer.unshift(...toMerge);
         return;
     }
@@ -1566,6 +1585,37 @@ function assembleSummaryBlock() {
 
     return s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
 }
+
+// ─── Strict verbatim cap (generation interceptor) ────────────────────
+// Runs right before the prompt is built. Keeps only the newest `verbatimTurns`
+// assistant messages in the payload, regardless of how far summarization has got.
+function summaryceptionGenerateInterceptor(chat, _contextSize, _abort, type) {
+    try {
+        const s = getSettings();
+        if (!s.enabled || type === 'quiet' || !Array.isArray(chat)) return;
+
+        const limit = Math.max(0, Number(s.verbatimTurns) || 0);
+        const assistantIdx = [];
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || m.is_user || m.is_system) continue;
+            if (!m.mes || !String(m.mes).trim()) continue;
+            assistantIdx.push(i);
+        }
+
+        const excess = assistantIdx.length - limit;
+        if (excess <= 0) return;
+
+        const drop = new Set(assistantIdx.slice(0, excess));
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (drop.has(i)) chat.splice(i, 1);
+        }
+        log(`Payload cap: dropped ${excess} older assistant turn(s), kept ${limit}.`);
+    } catch (e) {
+        log('Generate interceptor error:', e);
+    }
+}
+globalThis.summaryceptionGenerateInterceptor = summaryceptionGenerateInterceptor;
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
 
@@ -2083,21 +2133,29 @@ function bindUIEvents() {
         });
     }
 
-    $(document).on('input', '#sc_auto_delete_depth', async function () {
+    // Dragging the slider only updates the label; the setting is committed on release.
+    $(document).on('input', '#sc_auto_delete_depth', function () {
         const val = parseInt($(this).val(), 10) || 0;
-        getSettings().autoDeleteDepth = val;
+        $('#sc_auto_delete_depth_val').text(val === 0 ? 'Off' : val);
+    });
+
+    $(document).on('change', '#sc_auto_delete_depth', async function () {
+        const s = getSettings();
+        const val = parseInt($(this).val(), 10) || 0;
+        const existing = val > 0 ? (getChatStore().layers[val]?.length || 0) : 0;
+
+        // Snippets already sitting at the chosen depth are removed only after confirmation.
+        if (existing > 0 && confirm(
+            `Auto-delete depth ${val} will remove ${existing} existing summary snippet(s) at that layer. Continue?\n\nCancel keeps them.`
+        )) {
+            const removed = pruneAutoDeleteDepth(val);
+            await saveChatStore();
+            toastr.info(`Auto-deleted ${removed} existing snippet(s) at depth ${val}`, 'Summaryception', { timeOut: TUNING.toastDefault });
+        }
+
+        s.autoDeleteDepth = val;
         $('#sc_auto_delete_depth_val').text(val === 0 ? 'Off' : val);
         saveSettings();
-
-        const removed = pruneAutoDeleteDepth();
-        if (removed > 0) {
-            await saveChatStore();
-            toastr.info(
-                `Auto-deleted ${removed} existing snippet(s) at depth ${val}`,
-                'Summaryception',
-                { timeOut: TUNING.toastDefault }
-            );
-        }
         updateInjection();
         updateUI();
     });
@@ -2624,247 +2682,4 @@ function initConnectionUI() {
     }
 
     // ── OpenAI Key ──
-    const openaiKey = document.getElementById('summaryception_openai_key');
-    if (openaiKey) {
-        openaiKey.value = s().openaiKey || '';
-        openaiKey.addEventListener('input', () => {
-            s().openaiKey = openaiKey.value.trim();
-            save();
-        });
-    }
-
-    // ── OpenAI Model ──
-    const openaiModel = document.getElementById('summaryception_openai_model');
-    if (openaiModel) {
-        openaiModel.value = s().openaiModel || '';
-        openaiModel.addEventListener('input', () => {
-            s().openaiModel = openaiModel.value.trim();
-            save();
-        });
-    }
-
-    // ── OpenAI Max Tokens ──
-    const openaiMaxTokens = document.getElementById('summaryception_openai_max_tokens');
-    if (openaiMaxTokens) {
-        openaiMaxTokens.value = s().openaiMaxTokens || 0;
-        openaiMaxTokens.addEventListener('input', () => {
-            s().openaiMaxTokens = parseInt(openaiMaxTokens.value, 10) || 0;
-            save();
-        });
-    }
-
-    // ── OpenAI Test button ──
-    const openaiTest = document.getElementById('summaryception_openai_test');
-    if (openaiTest) {
-        openaiTest.addEventListener('click', async () => {
-            await testOpenAIConnectionHandler();
-        });
-    }
-
-    // Set initial visibility
-    updateConnectionSubPanels(s().connectionSource || 'default');
-}
-
-function updateConnectionSubPanels(source) {
-    const panels = {
-        profile: document.getElementById('summaryception_profile_settings'),
-        ollama: document.getElementById('summaryception_ollama_settings'),
-        openai: document.getElementById('summaryception_openai_settings'),
-    };
-
-    Object.values(panels).forEach(panel => {
-        if (panel) panel.style.display = 'none';
-    });
-
-    if (panels[source]) {
-        panels[source].style.display = 'block';
-    }
-}
-
-function populateOllamaModelDropdown(selectElement, models, currentValue) {
-    selectElement.innerHTML = '<option value="">-- Select Model --</option>';
-
-    if (models && models.length > 0) {
-        for (const model of models) {
-            const opt = document.createElement('option');
-            opt.value = model.name || model;
-            opt.textContent = model.name || model;
-            selectElement.appendChild(opt);
-        }
-    }
-
-    if (currentValue) {
-        selectElement.value = currentValue;
-    }
-}
-
-async function refreshOllamaModels() {
-    const s = getSettings();
-    const ollamaUrl = s.ollamaUrl || 'http://localhost:11434';
-    const modelSelect = document.getElementById('summaryception_ollama_model');
-
-    showConnectionStatus('loading', 'Fetching Ollama models...');
-
-    try {
-        const models = await fetchOllamaModels(ollamaUrl);
-        s.ollamaModelsCache = models.map(m => ({ name: m.name }));
-        saveSettings();
-
-        if (modelSelect) {
-            populateOllamaModelDropdown(modelSelect, models, s.ollamaModel);
-        }
-
-        showConnectionStatus('success', `Found ${models.length} model(s)`);
-        toastr.success(`Found ${models.length} Ollama model(s)`, 'Summaryception');
-    } catch (error) {
-        console.error('[Summaryception] Failed to fetch Ollama models:', error);
-        showConnectionStatus('error', `Failed: ${error.message}`);
-        toastr.error(`Failed to fetch Ollama models: ${error.message}`, 'Summaryception');
-    }
-}
-
-async function testOpenAIConnectionHandler() {
-    const s = getSettings();
-
-    if (!s.openaiUrl) {
-        toastr.warning('Please enter an endpoint URL first.', 'Summaryception');
-        return;
-    }
-    if (!s.openaiModel) {
-        toastr.warning('Please enter a model name first.', 'Summaryception');
-        return;
-    }
-
-    showConnectionStatus('loading', 'Testing connection...');
-
-    const result = await testOpenAIConnection(s.openaiUrl, s.openaiKey, s.openaiModel);
-
-    if (result.success) {
-        showConnectionStatus('success', result.message);
-        toastr.success(result.message, 'Summaryception');
-    } else {
-        showConnectionStatus('error', result.message);
-        toastr.error(result.message, 'Summaryception');
-    }
-}
-
-function showConnectionStatus(type, message) {
-    const container = document.getElementById('summaryception_connection_status');
-    const icon = document.getElementById('summaryception_connection_status_icon');
-    const text = document.getElementById('summaryception_connection_status_text');
-
-    if (!container || !icon || !text) return;
-
-    container.style.display = 'flex';
-    container.className = 'summaryception-connection-status ' + type;
-
-    const icons = {
-        success: 'fa-solid fa-circle-check',
-        error: 'fa-solid fa-circle-xmark',
-        loading: 'fa-solid fa-spinner fa-spin',
-    };
-
-    icon.className = icons[type] || 'fa-solid fa-circle';
-    text.textContent = message;
-
-    if (type !== 'loading') {
-        setTimeout(() => {
-            if (container) container.style.display = 'none';
-        }, TUNING.connectionStatusTimeout);
-    }
-}
-
-async function fetchProfilesFallback(selectElement, currentValue) {
-    try {
-        const response = await fetch('/api/connection-manager/profiles', {
-            method: 'GET',
-            headers: SillyTavern.getContext().getRequestHeaders?.() || {
-                'Content-Type': 'application/json',
-            },
-        });
-
-        if (!response.ok) {
-            console.warn('[Summaryception] Could not fetch connection profiles from API');
-            return;
-        }
-
-        const profiles = await response.json();
-
-        selectElement.innerHTML = '<option value="">-- Select a Profile --</option>';
-
-        if (Array.isArray(profiles)) {
-            for (const profile of profiles) {
-                const opt = document.createElement('option');
-                opt.value = profile.id || profile.name;
-                opt.textContent = profile.name || profile.id;
-                selectElement.appendChild(opt);
-            }
-        } else if (typeof profiles === 'object') {
-            for (const [id, profile] of Object.entries(profiles)) {
-                const opt = document.createElement('option');
-                opt.value = id;
-                opt.textContent = profile.name || id;
-                selectElement.appendChild(opt);
-            }
-        }
-
-        if (currentValue) {
-            selectElement.value = currentValue;
-        }
-    } catch (error) {
-        console.warn('[Summaryception] Could not fetch connection profiles:', error);
-    }
-}
-
-// ─── Initialization ──────────────────────────────────────────────────
-
-/**
- * Work out this extension's folder as SillyTavern expects it (e.g. "third-party/My-Folder"),
- * from the URL this module was loaded from. Lets the extension run from any folder name.
- */
-function getExtensionTemplateName() {
-    const fallback = 'third-party/Summaryception';
-    try {
-        const path = new URL('.', import.meta.url).pathname.replace(/\/+$/, '');
-        const marker = '/extensions/';
-        const idx = path.indexOf(marker);
-        if (idx === -1) return fallback;
-        return decodeURIComponent(path.slice(idx + marker.length));
-    } catch (e) {
-        return fallback;
-    }
-}
-
-const EXTENSION_TEMPLATE_NAME = getExtensionTemplateName();
-
-(async function init() {
-    const {
-        eventSource,
-        event_types,
-        renderExtensionTemplateAsync,
-    } = SillyTavern.getContext();
-
-    getSettings();
-
-    const html = await renderExtensionTemplateAsync(
-        EXTENSION_TEMPLATE_NAME,
-        'settings',
-        {}
-    );
-    $('#extensions_settings2').append(html);
-
-    bindUIEvents();
-    initConnectionUI();
-
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-
-    registerSlashCommands();
-
-    eventSource.on(event_types.APP_READY, () => {
-        updateInjection();
-        updateUI();
-        console.log(LOG_PREFIX, 'v5.5.4 loaded. Connection Settings available');
-    });
-})();
+    const openaiK
