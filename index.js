@@ -606,12 +606,25 @@ async function repairIfBranched() {
 
     const chatLength = chat.length;
 
-    // A branch copies metadata into a NEW chat id, so a store whose chatId matches the
-    // current chat was not branched (it may just be loaded late or the chat is shorter).
-    const sameChat = !!store.chatId && store.chatId === currentChatKey();
+    // A branch copies the metadata into a NEW chat id. Only a store that was saved under a
+    // DIFFERENT chat id is a branch. A store with no id, or the same id, is this chat: a
+    // shorter chat there means messages were deleted or the file lost its tail, so the
+    // summaries are kept and only the pointer is pulled back. Never delete on a guess.
+    const storedId = store.chatId;
+    const currentId = currentChatKey();
+    const isBranch = !!storedId && !!currentId && storedId !== currentId;
 
-    // If summarizedUpTo is beyond (or at) the end of the chat, we branched
-    if (store.summarizedUpTo >= chatLength && !sameChat) {
+    if (store.summarizedUpTo >= chatLength && !isBranch) {
+        log(`Chat is shorter (${chatLength}) than its summary range (${store.summarizedUpTo}); keeping summaries and clamping the pointer.`);
+        store.summarizedUpTo = chatLength - 1;
+        store.ghostedIndices = (store.ghostedIndices || []).filter(idx => idx < chatLength);
+        await saveChatStore();
+        return;
+    }
+
+    // If summarizedUpTo is beyond (or at) the end of the chat, and the chat is a different
+    // chat id, this is a real branch: drop what referenced messages past the branch point.
+    if (store.summarizedUpTo >= chatLength && isBranch) {
         const oldSummarizedUpTo = store.summarizedUpTo;
         log(`Branch detected! summarizedUpTo (${oldSummarizedUpTo}) >= chat length (${chatLength}). Repairing...`);
 
